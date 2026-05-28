@@ -1053,6 +1053,36 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   // ----------------------------------------------------------------------------------------------
   
   /**
+  @brief sets the spin duration before workers enter sleep
+
+  @param us spin duration in microseconds
+
+  Sets the maximum duration a worker will spin while idle before entering
+  sleep. During this spin period, workers continuously check for new tasks
+  using _mm_pause to maintain CPU frequency and low latency. After the
+  spin duration expires, workers will sleep via the notifier until new
+  tasks are submitted.
+
+  A value of 0 (default) means infinite spin (current behavior).
+  Recommended values:
+    - 0:     infinite spin (keep CPU hot, best for continuous workloads)
+    - 100ms: spin for ~100ms then sleep (good for frame-based workloads)
+    - 1s:    spin for ~1s then sleep (good for bursty workloads)
+
+  @code{.cpp}
+  executor.spin_duration(std::chrono::milliseconds(100));
+  @endcode
+  */
+  void spin_duration(std::chrono::microseconds us) { _spin_duration_us = us; }
+
+  /**
+  @brief queries the spin duration
+
+  @return the current spin duration in microseconds
+  */
+  std::chrono::microseconds spin_duration() const { return _spin_duration_us; }
+
+  /**
   @brief creates a task group that executes a collection of asynchronous tasks
   @return a tf::TaskGroup object associated with the current executor
  
@@ -1113,6 +1143,9 @@ requires (!std::same_as<std::decay_t<I>, AsyncTask>)
   // or the false sharing can cause serious performance drop
   alignas(TF_CACHELINE_SIZE) DefaultNotifier _notifier;
   alignas(TF_CACHELINE_SIZE) std::atomic<size_t> _num_topologies {0};
+  
+  // Spin duration before workers enter sleep (0 = infinite spin)
+  std::chrono::microseconds _spin_duration_us{0};
   
   std::unordered_map<std::thread::id, Worker*> _t2w;
   std::unordered_set<std::shared_ptr<ObserverInterface>> _observers;
@@ -1418,6 +1451,10 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
     if(vtm >= w._id) vtm++;
  
     if(++num_steals > MAX_STEALS) {
+      // Yield periodically to avoid starving other threads.
+      // In dense job scenarios, all workers spin-steal aggressively,
+      // competing for CPU time with the main thread. Yielding allows
+      // the OS to schedule other threads, improving overall throughput.
       std::this_thread::yield();
       if(num_steals > 150 + MAX_STEALS) {
         break;
@@ -1498,66 +1535,105 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
 // Function: _wait_for_task
 inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
 
-  explore_task:
+  // Spin with _mm_pause, continuously checking for new tasks.
+  // The worker thread stays hot (spinning) to achieve microsecond-level
+  // response time, while the main thread can sleep independently.
+  // We check _num_topologies on every pause to detect new task submissions
+  // with minimal latency. When _num_topologies is non-zero, we immediately
+  // attempt to steal a task.
+  //
+  // For dense workloads (no frame interval), this ensures workers detect
+  // and steal tasks with minimal delay. For frame-paced workloads (16ms
+  // intervals), the worker stays hot and responds instantly when the main
+  // thread submits new tasks after sleeping.
+  //
+  // Backoff strategy: after several spin batches without finding work,
+  // yield the CPU to avoid starving other threads. This is critical for
+  // dense job scenarios where all workers are spinning and competing for
+  // CPU time with the main thread and each other.
+  //
+  // Spin duration: if _spin_duration_us is set to a non-zero value, workers
+  // will spin for at most that duration before entering sleep via the
+  // notifier. This allows the executor to release CPU resources when idle
+  // for extended periods (e.g., after all frames have completed), while
+  // maintaining low latency during active frame intervals.
+  constexpr uint32_t SPIN_BATCH = 256;
+  constexpr uint32_t YIELD_INTERVAL = 4;  // Yield every N spin batches
+  uint32_t spin = 0;
+  uint32_t idleBatches = 0;
 
-  if(_explore_task(w, t) == false) {
-    return false;
-  }
-  
-  // Go exploit the task if we successfully steal one.
-  if(t) {
-    return true;
-  }
+  // Record the start time for spin duration tracking
+  auto spin_start = std::chrono::steady_clock::now();
 
-  // Entering the 2PC guard as all queues are likely empty after many stealing attempts.
-  _notifier.prepare_wait(w._id);
+  while(true) {
 
-  // Fast path: if no topologies are live, all queues are guaranteed empty.
-  // Skip the O(N) buffer and worker queue scans and go directly to sleep.
-  // This is safe because prepare_wait has already been called — any notify
-  // that arrives after this check but before commit_wait will be caught by
-  // the 2PC guarantee of the notifier.
-  if(_num_topologies.load(std::memory_order_relaxed) == 0) {
-    // still check done flag before committing to sleep
-    if(w._done.test(std::memory_order_relaxed)) {
-      _notifier.cancel_wait(w._id);
+    // Batch spin: do _mm_pause iterations before attempting steal
+    while(spin < SPIN_BATCH) {
+      if(w._done.test(std::memory_order_relaxed)) {
+        return false;
+      }
+      spin++;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+      _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+      __asm__ __volatile__("yield" ::: "memory");
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+    spin = 0;
+    idleBatches++;
+
+    // Periodically yield to avoid starving other threads
+    // When all workers are spinning and no tasks are available,
+    // yielding allows the OS to schedule other threads (including
+    // the main thread that may be submitting new tasks).
+    if (idleBatches >= YIELD_INTERVAL) {
+      std::this_thread::yield();
+      idleBatches = 0;
+    }
+
+    // Try to steal a task
+    if(_explore_task(w, t) == false) {
       return false;
     }
-    _notifier.commit_wait(w._id);
-    goto explore_task;
-  }
-  
-  // Condition #1: buffers should be empty
-  for(size_t b=0; b<_buffers.size(); ++b) {
-    if(!_buffers[b].queue.empty()) {
-      _notifier.cancel_wait(w._id);
-      w._sticky_victim = b + _workers.size();
-      goto explore_task;
+
+    if(t) {
+      return true;
+    }
+
+    // Check if we've exceeded the spin duration threshold.
+    // If _spin_duration_us > 0, workers will spin for at most that
+    // duration before entering sleep. This is useful for frame-based
+    // workloads where workers should stay hot during frame intervals
+    // but release CPU after all frames have completed.
+    if(_spin_duration_us.count() > 0) {
+      auto now = std::chrono::steady_clock::now();
+      if(now - spin_start >= _spin_duration_us) {
+        // Spin duration exceeded, enter sleep via the notifier.
+        // This uses the two-phase wait protocol to prevent lost wakeups:
+        // 1. prepare_wait: publish our intent to sleep
+        // 2. re-check for tasks (prevent lost wakeup)
+        // 3. commit_wait: actually sleep
+        _notifier.prepare_wait(w._id);
+
+        // Re-check for tasks after prepare_wait (prevents lost wakeup)
+        if(_explore_task(w, t) == false) return false;
+        if(t) {
+          _notifier.cancel_wait(w._id);
+          return true;
+        }
+
+        // Enter sleep. Will be woken by _notifier.notify_one() when
+        // new tasks are submitted via _schedule.
+        _notifier.commit_wait(w._id);
+
+        // Woken up, reset the spin timer and continue spinning
+        spin_start = std::chrono::steady_clock::now();
+        idleBatches = 0;
+      }
     }
   }
-  
-  // Condition #2: worker queues should be empty
-  // Note: We need to use index-based looping to avoid data race with _spawn
-  // which initializes other worker data structure at the same time.
-  // Also, due to the property of a work-stealing queue, we don't need to check 
-  // this worker's work-stealing queue.
-  for(size_t k=0; k<_workers.size()-1; ++k) {
-    if(size_t vtm = k + (k >= w._id); !_workers[vtm]._wsq.empty()) {
-      _notifier.cancel_wait(w._id);
-      w._sticky_victim = vtm;
-      goto explore_task;
-    }
-  }
-  
-  // Condition #3: worker should be alive
-  if(w._done.test(std::memory_order_relaxed)) {
-    _notifier.cancel_wait(w._id);
-    return false;
-  }
-  
-  // Now I really need to relinquish myself to others.
-  _notifier.commit_wait(w._id);
-  goto explore_task;
 }
 
 // Function: make_observer
