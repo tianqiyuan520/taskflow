@@ -1557,6 +1557,12 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
   // notifier. This allows the executor to release CPU resources when idle
   // for extended periods (e.g., after all frames have completed), while
   // maintaining low latency during active frame intervals.
+  //
+  // When _spin_duration_us is 0, workers skip spinning entirely and
+  // immediately enter sleep via the notifier. This is optimal for
+  // frame-based workloads where the main thread handles CPU frequency
+  // maintenance via its own spin loop in Complete(), and worker threads
+  // should not compete for CPU during frame intervals.
   constexpr uint32_t SPIN_BATCH = 256;
   constexpr uint32_t YIELD_INTERVAL = 4;  // Yield every N spin batches
   uint32_t spin = 0;
@@ -1607,6 +1613,10 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
     // duration before entering sleep. This is useful for frame-based
     // workloads where workers should stay hot during frame intervals
     // but release CPU after all frames have completed.
+    //
+    // When _spin_duration_us is 0, we skip the spin duration check
+    // and immediately enter sleep. This is the default for frame-based
+    // workloads where the main thread handles CPU frequency maintenance.
     if(_spin_duration_us.count() > 0) {
       auto now = std::chrono::steady_clock::now();
       if(now - spin_start >= _spin_duration_us) {
@@ -1632,6 +1642,28 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
         spin_start = std::chrono::steady_clock::now();
         idleBatches = 0;
       }
+    }
+    else {
+      // _spin_duration_us == 0: immediately enter sleep without spinning.
+      // This is the default for frame-based workloads. The main thread
+      // handles CPU frequency maintenance via its own spin loop in
+      // Complete(), so worker threads should not compete for CPU.
+      _notifier.prepare_wait(w._id);
+
+      // Re-check for tasks after prepare_wait (prevents lost wakeup)
+      if(_explore_task(w, t) == false) return false;
+      if(t) {
+        _notifier.cancel_wait(w._id);
+        return true;
+      }
+
+      // Enter sleep. Will be woken by _notifier.notify_one() when
+      // new tasks are submitted via _schedule.
+      _notifier.commit_wait(w._id);
+
+      // Woken up, reset the spin timer and continue
+      spin_start = std::chrono::steady_clock::now();
+      idleBatches = 0;
     }
   }
 }
